@@ -120,25 +120,45 @@ func (v *STAC) Validate(instance any) (Result, error) {
 	return res, nil
 }
 
-// collectErrors flattens a ValidationError tree into a slice of Error using
-// the library's BasicOutput format, which provides a flat list of failures
-// with string instance-location paths and human-readable messages.
+// collectErrors extracts ONLY the actionable leaf errors from the validation tree.
 func collectErrors(schemaURL string, ve *jsonschema.ValidationError) []Error {
-	basic := ve.BasicOutput()
+	detailed := ve.DetailedOutput()
+	if detailed == nil {
+		return nil
+	}
+	return extractLeaves(schemaURL, *detailed)
+}
 
-	var out []Error
-	for _, unit := range basic.Errors {
+// extractLeaves recursively walks the DetailedOutput tree and returns only
+// the nodes that have no children. This strips out the useless "'allOf' failed" 
+// wrapper messages and gives you the exact missing fields or type mismatches.
+func extractLeaves(schemaURL string, unit jsonschema.OutputUnit) []Error {
+	// If this node has no children, it's a root cause (leaf error)
+	if len(unit.Errors) == 0 {
 		msg := ""
 		if unit.Error != nil {
 			msg = unit.Error.String()
 		}
-		out = append(out, Error{
+		
+		// Occasionally a leaf error is empty if it's just a structural boolean failure,
+		// but we'll capture it anyway just in case.
+		if msg == "" {
+			msg = "validation failed"
+		}
+
+		return []Error{{
 			Path:      unit.InstanceLocation,
 			Message:   msg,
 			SchemaURL: schemaURL,
-		})
+		}}
 	}
-	return out
+
+	// If it has children, ignore this parent node and dig deeper
+	var leaves []Error
+	for _, child := range unit.Errors {
+		leaves = append(leaves, extractLeaves(schemaURL, child)...)
+	}
+	return leaves
 }
 
 // stringField extracts a non-empty string value from a map, returning a

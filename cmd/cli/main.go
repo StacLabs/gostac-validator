@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/StacLabs/gostac-validator/internal/schemas"
 	"github.com/StacLabs/gostac-validator/internal/validator"
@@ -51,8 +52,9 @@ func main() {
 
 // fileResult is the per-file JSON output written to stdout.
 type fileResult struct {
-	File   string          `json:"file"`
-	Result validator.Result `json:"result"`
+	File     string           `json:"file"`
+	Duration string           `json:"duration"` // Added this!
+	Result   validator.Result `json:"result"`
 }
 
 func validateFile(v *validator.STAC, path string) (bool, error) {
@@ -80,7 +82,10 @@ func validateFile(v *validator.STAC, path string) (bool, error) {
 		return false, fmt.Errorf("parsing JSON: %w", err)
 	}
 
+	start := time.Now()
 	result, err := v.Validate(instance)
+	duration := time.Since(start) // Stop the timer
+
 	if err != nil {
 		return false, err
 	}
@@ -90,7 +95,11 @@ func validateFile(v *validator.STAC, path string) (bool, error) {
 		label = "<stdin>"
 	}
 
-	out := fileResult{File: label, Result: result}
+	out := fileResult{
+		File:     label,
+		Duration: duration.String(),
+		Result:   result,
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(out); err != nil {

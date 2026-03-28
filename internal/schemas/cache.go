@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dlclark/regexp2"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -25,6 +26,16 @@ type Cache struct {
 // load remote schemas over HTTP when they are not already cached.
 func NewCache() *Cache {
 	c := jsonschema.NewCompiler()
+
+	// 1. Wire up the custom PCRE regex engine using our wrapper
+	c.UseRegexpEngine(func(s string) (jsonschema.Regexp, error) {
+		re, err := regexp2.Compile(s, 0)
+		if err != nil {
+			return nil, err
+		}
+		return regexp2Wrapper{re: re}, nil
+	})
+
 	c.UseLoader(jsonschema.SchemeURLLoader{
 		"file":  jsonschema.FileLoader{},
 		"http":  newHTTPLoader(),
@@ -32,6 +43,21 @@ func NewCache() *Cache {
 	})
 
 	return &Cache{compiler: c}
+}
+
+// 2. The Wrapper that translates regexp2 into the interface jsonschema expects
+type regexp2Wrapper struct {
+	re *regexp2.Regexp
+}
+
+func (r regexp2Wrapper) MatchString(s string) bool {
+	// regexp2 returns (bool, error). We ignore the error with '_'
+	match, _ := r.re.MatchString(s)
+	return match
+}
+
+func (r regexp2Wrapper) String() string {
+	return r.re.String()
 }
 
 // Get returns the compiled schema for the given URL, compiling and caching it
