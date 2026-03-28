@@ -1,26 +1,26 @@
 // Package server provides HTTP handlers for the STAC validator API.
-// Each handler decodes an incoming JSON request, resolves the appropriate
-// JSON schema from the shared cache, validates the payload, and returns a
-// structured JSON response.
+// Each handler decodes an incoming JSON request body as a raw STAC object,
+// auto-detects the applicable schemas from the object's own `type` and
+// `stac_extensions` fields, and returns a structured JSON response.
 package server
 
 import (
+	"bytes"
 	"encoding/json"
-	"errors"
 	"net/http"
 
-	"github.com/StacLabs/gostac-validator/internal/schemas"
+	"github.com/StacLabs/gostac-validator/internal/validator"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // Handler holds the dependencies needed by every HTTP handler in this package.
 type Handler struct {
-	cache *schemas.Cache
+	validator *validator.STAC
 }
 
-// NewHandler returns a Handler wired to the supplied schema cache.
-func NewHandler(cache *schemas.Cache) *Handler {
-	return &Handler{cache: cache}
+// NewHandler returns a Handler wired to the supplied STAC validator.
+func NewHandler(v *validator.STAC) *Handler {
+	return &Handler{validator: v}
 }
 
 // RegisterRoutes attaches all routes to mux.  Callers may pass http.DefaultServeMux
@@ -30,106 +30,54 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", h.Health)
 }
 
-// validateRequest is the JSON body accepted by the /validate endpoint.
-type validateRequest struct {
-	// SchemaURL is the canonical URL of the JSON Schema to validate against
-	// (e.g. "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json").
-	SchemaURL string `json:"schema_url"`
-	// Object is the raw STAC JSON to validate.
-	Object json.RawMessage `json:"object"`
-}
-
-// validationError represents a single schema validation failure.
-type validationError struct {
-	Path    string `json:"path"`
-	Message string `json:"message"`
-}
-
-// validateResponse is the JSON body returned by the /validate endpoint.
-type validateResponse struct {
-	Valid  bool              `json:"valid"`
-	Errors []validationError `json:"errors,omitempty"`
-}
-
-// healthResponse is the JSON body returned by the /health endpoint.
-type healthResponse struct {
-	Status string `json:"status"`
-}
-
 // Validate handles POST /validate.
-// It decodes the request body, fetches (or retrieves from cache) the specified
-// JSON Schema, validates the supplied STAC object, and returns a JSON response
-// describing whether the object is valid and any validation errors.
+//
+// The request body must be a raw STAC Item, Catalog, or Collection JSON object.
+// The handler reads the `type` and `stac_version` fields to resolve the correct
+// base schema, then validates against each URL in `stac_extensions` as well.
+//
+// Precision is preserved by using jsonschema.UnmarshalJSON instead of the
+// standard library decoder, which would truncate large floating-point
+// coordinates to float64.
 func (h *Handler) Validate(w http.ResponseWriter, r *http.Request) {
-	var req validateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
-		return
-	}
-
-	if req.SchemaURL == "" {
-		writeError(w, http.StatusBadRequest, "schema_url is required")
-		return
-	}
-	if len(req.Object) == 0 {
-		writeError(w, http.StatusBadRequest, "object is required")
-		return
-	}
-
-	schema, err := h.cache.Get(req.SchemaURL)
+	body, err := readBody(w, r)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "could not load schema: "+err.Error())
+		writeError(w, http.StatusBadRequest, "could not read request body: "+err.Error())
 		return
 	}
 
-	// Decode the raw JSON object into a generic value so the schema library
-	// can validate it without depending on a concrete Go type.
-	var instance any
-	if err := json.Unmarshal(req.Object, &instance); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid object JSON: "+err.Error())
+	// Use jsonschema.UnmarshalJSON to preserve full numeric precision for
+	// geographic coordinates that would otherwise be truncated by float64.
+	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(body))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	resp := validateResponse{Valid: true}
-
-	if err := schema.Validate(instance); err != nil {
-		var valErr *jsonschema.ValidationError
-		if errors.As(err, &valErr) {
-			resp.Valid = false
-			resp.Errors = collectErrors(valErr)
-		} else {
-			writeError(w, http.StatusInternalServerError, "validation error: "+err.Error())
-			return
-		}
+	result, err := h.validator.Validate(instance)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, result)
 }
 
 // Health handles GET /health and returns a simple liveness check.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// collectErrors flattens the tree of jsonschema.ValidationError into a slice
-// of validationError values suitable for serialising into the API response.
-// It uses the library's BasicOutput format which provides a flat list of
-// failures with string instance-location paths and human-readable messages.
-func collectErrors(ve *jsonschema.ValidationError) []validationError {
-	basic := ve.BasicOutput()
-
-	var out []validationError
-	for _, unit := range basic.Errors {
-		msg := ""
-		if unit.Error != nil {
-			msg = unit.Error.String()
-		}
-		out = append(out, validationError{
-			Path:    unit.InstanceLocation,
-			Message: msg,
-		})
+// readBody reads the entire request body and returns it as bytes, capping at
+// 10 MiB to guard against excessively large payloads.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	const maxBytes = 10 << 20 // 10 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r.Body); err != nil {
+		return nil, err
 	}
-	return out
+	return buf.Bytes(), nil
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
@@ -143,3 +91,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
+

@@ -1,6 +1,7 @@
-// Command validator starts the STAC validation HTTP server.
-// It wires together the schema cache and HTTP handlers, then listens on the
-// address configured via the ADDR environment variable (default ":8080").
+// Command server starts the STAC validation HTTP server.
+// It wires together the schema cache, core STAC validator, and HTTP handlers,
+// then listens on the address configured via the ADDR environment variable
+// (default ":8080").
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 
 	"github.com/StacLabs/gostac-validator/internal/schemas"
 	"github.com/StacLabs/gostac-validator/internal/server"
+	"github.com/StacLabs/gostac-validator/internal/validator"
 )
 
 func main() {
@@ -26,9 +28,10 @@ func main() {
 	}
 
 	cache := schemas.NewCache()
+	v := validator.New(cache)
 
 	mux := http.NewServeMux()
-	handler := server.NewHandler(cache)
+	handler := server.NewHandler(v)
 	handler.RegisterRoutes(mux)
 
 	srv := &http.Server{
