@@ -4,11 +4,12 @@ An enterprise-grade, ultra-fast JSON Schema validator specifically built for the
 
 Written in Go, this tool solves the infamous STAC "Cold Start" `$ref` problem by intelligently downloading, resolving, compiling, and **caching** complex STAC extension schemas in RAM. 
 
-It drops validation times from ~2,500ms (network-bound) to **~1ms** (RAM-bound) per item, making it capable of validating millions of STAC items a day.
+It drops validation times from ~2,500ms (network-bound) down to **~0.24ms** (RAM-bound) per item, making it capable of validating millions of STAC items a day using native Go concurrency.
 
 ## Features
 * **Dual-Mode:** Run as a local CLI tool or a highly concurrent HTTP Microservice.
 * **Thread-Safe Schema Caching:** Downloads remote `$ref`s from GitHub exactly *once* and caches the compiled execution tree in RAM.
+* **Smart Batching:** Send a single Item, a raw JSON Array, or a massive `ItemCollection`. The server automatically detects the format and spins up thousands of Goroutines to validate them all concurrently.
 * **Auto-Discovery:** Automatically reads `type`, `stac_version`, and `stac_extensions` to apply the correct schemas natively.
 * **Lossless Precision:** Bypasses Go's default `float64` truncation to preserve massive STAC geographic coordinate precision safely.
 * **PCRE Regex Support:** Uses `regexp2` to natively handle STAC extensions (like `eo`) that require complex negative-lookahead regexes `^(?!eo:)`.
@@ -19,8 +20,8 @@ It drops validation times from ~2,500ms (network-bound) to **~1ms** (RAM-bound) 
 1. [Installation & Build](#installation--build)
 2. [CLI Usage](#cli-usage)
 3. [Microservice Usage](#microservice-usage)
-4. [Benchmarking the Cache](#benchmarking-the-cache)
-5. [Architecture overview](#architecture-overview)
+4. [Benchmarking & Performance](#benchmarking--performance)
+5. [Architecture Overview](#architecture-overview)
 
 ---
 
@@ -30,7 +31,7 @@ It drops validation times from ~2,500ms (network-bound) to **~1ms** (RAM-bound) 
 
 Clone the repository and download the dependencies:
 ```bash
-git clone [https://github.com/StacLabs/gostac-validator.git](https://github.com/StacLabs/gostac-validator.git)
+git clone https://github.com/StacLabs/gostac-validator.git
 cd gostac-validator
 go mod tidy
 ```
@@ -65,7 +66,7 @@ The CLI tool is perfect for local testing, CI/CD pipelines, or ad-hoc validation
       {
         "path": "/assets/SR_B2",
         "message": "additional properties 'eo:bands' not allowed",
-        "schema_url": "[https://stac-extensions.github.io/eo/v2.0.0/schema.json](https://stac-extensions.github.io/eo/v2.0.0/schema.json)"
+        "schema_url": "https://stac-extensions.github.io/eo/v2.0.0/schema.json"
       }
     ]
   }
@@ -84,6 +85,9 @@ The HTTP server uses a thread-safe `sync.Map` to cache compiled schemas. It is d
 ```
 
 ### Test via cURL:
+
+You can send a single STAC Item, a JSON array of items, or a full `ItemCollection`. The server will process batches concurrently.
+
 ```bash
 curl -X POST http://localhost:8080/validate \
      -H "Content-Type: application/json" \
@@ -98,38 +102,11 @@ curl -X POST http://localhost:8080/validate \
          }'
 ```
 
-## Benchmarking the Cache
+## Benchmarking & Performance
 
-To witness the speed of the schema caching engine, boot up the `./stac-server` in one terminal, and run this Python script in another.
+To witness the speed of the schema caching engine and Go's concurrency, boot up the `./stac-server` in one terminal, and run the benchmark scripts in another.
 
-### benchmark.py
-```python
-import time
-import requests
-import json
-
-# Load a local STAC item
-with open("sample_stac/test_item.json", "r") as f:
-    stac_item = json.load(f)
-
-url = "http://localhost:8080/validate"
-
-print("🔥 Sending First Request (Cold Start)...")
-start = time.time()
-requests.post(url, json=stac_item)
-print(f"First request took: {(time.time() - start) * 1000:.2f} ms\n")
-
-print("⚡ Sending 1,000 Requests (Warm Cache)...")
-start_bulk = time.time()
-for _ in range(1000):
-    requests.post(url, json=stac_item)
-total_time = time.time() - start_bulk
-
-print(f"Total time for 1,000 items: {total_time:.2f} seconds")
-print(f"Average time per STAC item: {(total_time / 1000) * 1000:.2f} ms")
-```
-
-### Results on standard hardware:
+### 1. Sequential HTTP Overhead (benchmark.py)
 
 ```plaintext
 🔥 Sending First Request (Cold Start)...
@@ -140,10 +117,32 @@ Total time for 1,000 items: 1.33 seconds
 Average time per STAC item: 1.33 ms
 ```
 
+### 2. Concurrent Batch Processing (benchmark_batch.py)
+
+This test wraps 10,000 STAC items into a single ItemCollection (~104 MB payload) and sends them in one POST request. The Go server spawns 10,000 Goroutines to validate them simultaneously against the RAM cache.
+
+```plaintext
+🔥 Sending 1 item to warm up the cache (Cold Start)...
+Cache warmed up!
+
+📦 Building an ItemCollection with 10,000 items...
+Payload size: 104.23 MB
+
+⚡ Firing massive batch at the Go server...
+
+✅ Batch Processing Complete!
+Total Items Processed: 10,000
+Valid Items: 0
+Invalid Items: 10,000
+------------------------------
+Total Time Taken: 2.4264 seconds
+Average Time per Item: 0.2426 ms
+Throughput: 4,121 items / second
+```
+
 ## Architecture Overview
 
 * **`cmd/`**: Contains the entry points for the applications (`cli` and `server`). These wrap the core business logic and handle the executable binaries.
 * **`internal/validator/`**: The core STAC business logic. It automatically detects STAC types, determines the required core and extension schemas, and executes the validation.
 * **`internal/schemas/`**: The thread-safe compiler and cache. It resolves remote `$ref` URLs safely and utilizes double-checked locking to prevent race conditions under high concurrency.
-* **`internal/server/`**: The HTTP handlers. It enforces JSON geographic coordinate precision decoding and implements max-byte payload limits for security.
-
+* **`internal/server/`**: The HTTP handlers. It enforces JSON geographic coordinate precision decoding, safely unpacks collections for Goroutine batching, and implements max-byte payload limits for security.
