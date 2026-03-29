@@ -7,34 +7,32 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/StacLabs/gostac-validator/internal/validator"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-// Handler holds the dependencies required by the HTTP endpoints.
-// It wraps the core STAC validator so that all requests share the same
-// thread-safe, in-memory schema cache.
+// Handler holds the dependencies for the HTTP server.
 type Handler struct {
 	validator *validator.STAC
 }
 
-// NewHandler creates a new HTTP Handler injected with the provided STAC validator.
+// NewHandler initializes the handler with a shared validator instance.
 func NewHandler(v *validator.STAC) *Handler {
 	return &Handler{validator: v}
 }
 
-// RegisterRoutes attaches the API endpoints to the provided HTTP multiplexer.
+// RegisterRoutes defines the API endpoints.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /validate", h.Validate)
 	mux.HandleFunc("GET /health", h.Health)
 }
 
-// BatchResponse represents the JSON payload returned by the /validate endpoint.
-// It provides a high-level summary of the batch operation alongside the detailed
-// validation results for each individual STAC item processed.
+// BatchResponse defines the JSON structure returned to the client.
 type BatchResponse struct {
 	TotalProcessed int                `json:"total_processed"`
 	ValidCount     int                `json:"valid_count"`
@@ -42,44 +40,39 @@ type BatchResponse struct {
 	Results        []validator.Result `json:"results"`
 }
 
-// Validate is the primary endpoint for STAC validation (POST /validate).
-// It intelligently detects the shape of the incoming JSON payload. If the payload
-// is a single STAC Item, it wraps it in a slice. If it is an array of items or a
-// FeatureCollection/ItemCollection, it extracts the items and validates them all
-// concurrently using a Goroutine worker pool.
+// Validate handles STAC validation for single items or batches.
 func (h *Handler) Validate(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	body, err := readBody(w, r)
 	if err != nil {
+		log.Printf("❌ Error reading body: %v", err)
 		writeError(w, http.StatusBadRequest, "could not read request body: "+err.Error())
 		return
 	}
 
-	// Parse JSON safely using jsonschema's unmarshaler to prevent Go from 
-	// silently truncating highly precise geographic coordinate floats.
 	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(body))
 	if err != nil {
+		log.Printf("❌ Error parsing JSON: %v", err)
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
 	var itemsToValidate []any
 
-	// Smart Routing: Inspect the generic parsed JSON to determine its structure.
+	// Smart Routing logic
 	switch data := instance.(type) {
 	case []any:
-		// Payload is a raw JSON array of STAC objects.
 		itemsToValidate = data
 	case map[string]any:
-		// Payload is a JSON object. Check if it is a collection of features.
 		if typ, ok := data["type"].(string); ok && (typ == "FeatureCollection" || typ == "ItemCollection") {
 			if features, ok := data["features"].([]any); ok {
 				itemsToValidate = features
 			} else {
-				writeError(w, http.StatusBadRequest, "FeatureCollection is missing the 'features' array")
+				writeError(w, http.StatusBadRequest, "Collection is missing the 'features' array")
 				return
 			}
 		} else {
-			// Payload is a single STAC Item, Catalog, or Collection. Wrap it for the batch processor.
 			itemsToValidate = []any{data}
 		}
 	default:
@@ -87,44 +80,74 @@ func (h *Handler) Validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process the entire batch concurrently.
+	// Process batch concurrently
 	results := h.validateConcurrent(itemsToValidate)
 
-	// Tally the results for the summary payload.
 	validCount := 0
+	type errorKey struct {
+		Message string
+		Schema  string
+	}
+	errorFrequencies := make(map[errorKey]int)
+
 	for _, res := range results {
 		if res.Valid {
 			validCount++
+		} else if len(res.Errors) > 0 {
+			// We group errors by Message and the Schema URL that failed
+			key := errorKey{
+				Message: res.Errors[0].Message,
+				Schema:  res.Errors[0].AbsoluteKeywordLocation, // Use AbsoluteKeywordLocation here
+			}
+			errorFrequencies[key]++
+		}
+	}
+	invalidCount := len(itemsToValidate) - validCount
+
+	// Log metrics with the new intelligent titles and error aggregation
+	duration := time.Since(start)
+	total := len(itemsToValidate)
+
+	if total == 1 {
+		if invalidCount > 0 && len(results[0].Errors) > 0 {
+			err := results[0].Errors[0]
+			log.Printf("📄 SINGLE ITEM | Valid: 0 | Invalid: 1 | Time: %v | Reason: %s (Schema: %s)",
+				duration, err.Message, err.AbsoluteKeywordLocation)
+		} else {
+			log.Printf("📄 SINGLE ITEM | Valid: 1 | Invalid: 0 | Time: %v", duration)
+		}
+	} else {
+		log.Printf("⚡ BATCH PROCESSED | Total: %d | Valid: %d | Invalid: %d | Time: %v",
+			total, validCount, invalidCount, duration)
+
+		if invalidCount > 0 {
+			log.Printf("   -> Failure Summary (%d unique error types):", len(errorFrequencies))
+			for key, count := range errorFrequencies {
+				log.Printf("      - [%d items]: %s", count, key.Message)
+				log.Printf("        Context: %s", key.Schema)
+			}
 		}
 	}
 
-	response := BatchResponse{
-		TotalProcessed: len(itemsToValidate),
+	writeJSON(w, http.StatusOK, BatchResponse{
+		TotalProcessed: total,
 		ValidCount:     validCount,
-		InvalidCount:   len(itemsToValidate) - validCount,
+		InvalidCount:   invalidCount,
 		Results:        results,
-	}
-
-	writeJSON(w, http.StatusOK, response)
+	})
 }
 
-// validateConcurrent validates a slice of STAC objects simultaneously.
-// It spawns a Goroutine for every item in the slice, allowing massive batches 
-// to be processed in the same time it takes to process a single item. It uses a 
-// sync.WaitGroup to block until all items have finished validating against the RAM cache.
+// validateConcurrent runs the validator across multiple goroutines.
 func (h *Handler) validateConcurrent(items []any) []validator.Result {
 	results := make([]validator.Result, len(items))
 	var wg sync.WaitGroup
 
 	for i, item := range items {
 		wg.Add(1)
-		
 		go func(index int, stacItem any) {
 			defer wg.Done()
-			
 			res, err := h.validator.Validate(stacItem)
 			if err != nil {
-				// Fallback for edge cases where the item itself is fundamentally malformed
 				res = validator.Result{
 					Valid:  false,
 					Errors: []validator.Error{{Message: err.Error()}},
@@ -133,23 +156,18 @@ func (h *Handler) validateConcurrent(items []any) []validator.Result {
 			results[index] = res
 		}(i, item)
 	}
-
 	wg.Wait()
-	
 	return results
 }
 
-// Health is a simple liveness probe endpoint (GET /health) used by Docker 
-// or Kubernetes to ensure the HTTP server is responsive.
+// Health is a liveness probe.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// readBody safely reads the HTTP request body into a byte slice. 
-// It enforces a 50 MiB limit using http.MaxBytesReader to prevent malicious 
-// or accidentally massive payloads from causing Out-Of-Memory (OOM) crashes.
+// readBody handles reading the request with a 150MB limit.
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
-	const maxBytes = 150 << 20 // 150 MiB
+	const maxBytes = 150 << 20
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r.Body); err != nil {
@@ -158,16 +176,14 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// writeJSON serializes the provided Go data structure into JSON and writes it 
-// to the HTTP response with the specified status code and headers.
+// writeJSON is a helper to return JSON responses.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeError is a convenience helper for formatting human-readable error messages 
-// into a standardized JSON response.
+// writeError is a helper for JSON error messages.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }

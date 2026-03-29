@@ -28,15 +28,14 @@ func baseSchemaURL(stacType, version string) (string, error) {
 	}
 }
 
-// Error is the structured result of a single schema validation failure.
+// Error represents a single validation failure.
 type Error struct {
-	Path      string `json:"path"`
-	Message   string `json:"message"`
-	SchemaURL string `json:"schema_url,omitempty"`
+	Message                 string `json:"message"`
+	InstanceLocation        string `json:"instance_location"`         // The path in the STAC item (e.g. /properties/eo:bands)
+	AbsoluteKeywordLocation string `json:"absolute_keyword_location"` // The Schema URL
 }
 
-// Result is returned by Validate and describes whether the object is valid
-// along with any validation errors.
+// Result is the outcome of validating a single STAC item.
 type Result struct {
 	Valid  bool    `json:"valid"`
 	Errors []Error `json:"errors,omitempty"`
@@ -110,9 +109,9 @@ func (v *STAC) Validate(instance any) (Result, error) {
 			var valErr *jsonschema.ValidationError
 			if errors.As(err, &valErr) {
 				res.Valid = false
-				res.Errors = append(res.Errors, collectErrors(schemaURL, valErr)...)
+				res.Errors = append(res.Errors, collectErrors(valErr)...)
 			} else {
-				return Result{}, fmt.Errorf("unexpected validation error: %w", err)
+				return Result{}, err
 			}
 		}
 	}
@@ -120,43 +119,43 @@ func (v *STAC) Validate(instance any) (Result, error) {
 	return res, nil
 }
 
-// collectErrors extracts ONLY the actionable leaf errors from the validation tree.
-func collectErrors(schemaURL string, ve *jsonschema.ValidationError) []Error {
+func collectErrors(ve *jsonschema.ValidationError) []Error {
 	detailed := ve.DetailedOutput()
 	if detailed == nil {
 		return nil
 	}
-	return extractLeaves(schemaURL, *detailed)
+	// We only pass the detailed object now
+	return extractLeaves(*detailed)
 }
 
 // extractLeaves recursively walks the DetailedOutput tree and returns only
-// the nodes that have no children. This strips out the useless "'allOf' failed" 
+// the nodes that have no children. This strips out the useless "'allOf' failed"
 // wrapper messages and gives you the exact missing fields or type mismatches.
-func extractLeaves(schemaURL string, unit jsonschema.OutputUnit) []Error {
+func extractLeaves(unit jsonschema.OutputUnit) []Error {
 	// If this node has no children, it's a root cause (leaf error)
 	if len(unit.Errors) == 0 {
 		msg := ""
 		if unit.Error != nil {
 			msg = unit.Error.String()
 		}
-		
-		// Occasionally a leaf error is empty if it's just a structural boolean failure,
-		// but we'll capture it anyway just in case.
+
 		if msg == "" {
 			msg = "validation failed"
 		}
 
 		return []Error{{
-			Path:      unit.InstanceLocation,
-			Message:   msg,
-			SchemaURL: schemaURL,
+			InstanceLocation:        unit.InstanceLocation,
+			Message:                 msg,
+			AbsoluteKeywordLocation: unit.AbsoluteKeywordLocation,
 		}}
 	}
 
 	// If it has children, ignore this parent node and dig deeper
 	var leaves []Error
 	for _, child := range unit.Errors {
-		leaves = append(leaves, extractLeaves(schemaURL, child)...)
+		// We removed 'schemaURL' from the arguments because 'unit'
+		// already contains the AbsoluteKeywordLocation!
+		leaves = append(leaves, extractLeaves(child)...)
 	}
 	return leaves
 }
