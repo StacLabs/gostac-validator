@@ -20,8 +20,9 @@ It drops validation times from ~2,500ms (network-bound) down to **~0.24ms** (RAM
 1. [Installation & Build](#installation--build)
 2. [CLI Usage](#cli-usage)
 3. [Microservice Usage](#microservice-usage)
-4. [Benchmarking & Performance](#benchmarking--performance)
-5. [Architecture Overview](#architecture-overview)
+4. [Configuration](#configuration)
+5. [Benchmarking & Performance](#benchmarking--performance)
+6. [Architecture Overview](#architecture-overview)
 
 ---
 
@@ -78,10 +79,22 @@ The CLI tool is perfect for local testing, CI/CD pipelines, or ad-hoc validation
 
 The HTTP server uses a thread-safe `sync.Map` to cache compiled schemas. It is designed to sit behind an ingestor API (like FastAPI) and process thousands of concurrent validation requests safely.
 
+## Configuration
+
+The STAC Validator Microservice can be tuned via environment variables to handle different infrastructure requirements and payload sizes.
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `ADDR` | The network address and port for the server to listen on. | `:8080` |
+| `MAX_BODY_SIZE_MB` | The maximum allowed size of an incoming POST request in Megabytes. | `150` |
+
 ### Start the server:
 ```bash
+# Start with default 150MB limit
 ./stac-server
-# 🚀 STAC Validation Server running on http://localhost:8080/validate
+
+# Start with a custom 512MB limit for large batches
+MAX_BODY_SIZE_MB=512 ./stac-server
 ```
 
 ### Test via cURL:

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -165,9 +167,29 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// readBody handles reading the request with a 150MB limit.
+// getBodyLimit returns the limit in bytes from MAX_BODY_SIZE_MB env var,
+// defaulting to 150MB.
+func getBodyLimit() int64 {
+	const defaultLimitMB = 150
+	limitStr := os.Getenv("MAX_BODY_SIZE_MB")
+	if limitStr == "" {
+		return defaultLimitMB << 20
+	}
+
+	limitMB, err := strconv.ParseInt(limitStr, 10, 64)
+	if err != nil {
+		// Log the error or just return default
+		return defaultLimitMB << 20
+	}
+
+	return limitMB << 20
+}
+
+// readBody handles reading the request with a configurable limit.
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
-	const maxBytes = 150 << 20
+	// Dynamically fetch the limit
+	maxBytes := getBodyLimit()
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r.Body); err != nil {
