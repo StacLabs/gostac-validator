@@ -1,6 +1,6 @@
 module github.com/StacLabs/gostac-validator
 
-go 1.26.1
+go 1.24.0
 
 require (
 	github.com/dlclark/regexp2 v1.11.0
